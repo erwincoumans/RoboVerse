@@ -1,28 +1,48 @@
 import torch
 
-from metasim.constants import TaskType
+from metasim.cfg.objects import RigidObjCfg
+from metasim.constants import PhysicStateType, TaskType
 from metasim.utils import configclass
 
 from ..base_task_cfg import BaseTaskCfg
 
 
 @configclass
-class AllegroHandReorientationCfg(BaseTaskCfg):
+class AllegroHandCfg(BaseTaskCfg):
     episode_length = 600
-    objects = []
     traj_filepath = None
     task_type = TaskType.TABLETOP_MANIPULATION
 
+    objects = [
+        RigidObjCfg(
+            name="block",
+            usd_path="roboverse_data/assets/isaacgymenvs/block_allegrohand_multicolor/urdf/cube_multicolor_allegro.urdf",
+            mjcf_path="roboverse_data/assets/isaacgymenvs/block_allegrohand_multicolor/urdf/cube_multicolor_allegro.urdf",
+            urdf_path="roboverse_data/assets/isaacgymenvs/block_allegrohand_multicolor/urdf/cube_multicolor_allegro.urdf",
+            default_position=(0.0, -0.2, 0.56),
+            default_orientation=(1.0, 0.0, 0.0, 0.0),
+        ),
+        RigidObjCfg(
+            name="goal",
+            usd_path="roboverse_data/assets/isaacgymenvs/block_allegrohand_multicolor/urdf/cube_multicolor_allegro.urdf",
+            mjcf_path="roboverse_data/assets/isaacgymenvs/block_allegrohand_multicolor/urdf/cube_multicolor_allegro.urdf",
+            urdf_path="roboverse_data/assets/isaacgymenvs/block_allegrohand_multicolor/urdf/cube_multicolor_allegro.urdf",
+            default_position=(0.0, 0.0, 0.92),
+            default_orientation=torch.nn.functional.normalize(torch.rand(4), p=2, dim=0),
+            physics=PhysicStateType.XFORM,
+        ),
+    ]
+
     def reward_fn(self, states):
         # Reward constants
-        dist_reward_scale = 10.0
+        dist_reward_scale = -10.0
         rot_reward_scale = 1.0
         rot_eps = 0.1
-        action_penalty_scale = 0.01
+        action_penalty_scale = -0.0002
         success_tolerance = 0.1
-        reach_goal_bonus = 10.0
-        fall_dist = 0.3
-        fall_penalty = -20.0
+        reach_goal_bonus = 250.0
+        fall_dist = 0.24
+        fall_penalty = 0.0
 
         # Handle both multi-env (IsaacGym) and single-env (Mujoco) formats
         rewards = []
@@ -87,3 +107,35 @@ class AllegroHandReorientationCfg(BaseTaskCfg):
     def _quat_conjugate(self, q):
         """Conjugate of quaternion."""
         return torch.tensor([-q[0], -q[1], -q[2], q[3]])
+
+    def termination_fn(self, states):
+        # Handle both multi-env (IsaacGym) and single-env (Mujoco) formats
+        terminations = []
+        for env_state in states:
+            # Extract necessary state information
+            robot_state = env_state.get("robots", {}).get("allegro_hand", {})
+            block_state = env_state.get("objects", {}).get("block", {})
+            goal_state = env_state.get("objects", {}).get("goal", {})
+            progress = env_state.get("progress", 0)  # Current episode step count
+
+            # Extract object and goal poses
+            robot_pos = robot_state.get("pos", torch.zeros(3))
+            block_pos = block_state.get("pos", torch.zeros(3))
+            block_rot = block_state.get("rot", torch.tensor([1.0, 0.0, 0.0, 0.0]))
+            goal_rot = goal_state.get("rot", torch.tensor([1.0, 0.0, 0.0, 0.0]))
+            # Constants (matching those used in reward function)
+            fall_dist = 0.24
+            max_episode_length = 600  # From class definition
+
+            # Calculate distance to goal
+            goal_dist = torch.norm(block_pos - robot_pos, p=2)
+
+            # Termination conditions:
+            # 1. Episode timeout
+            # 2. Object has fallen/moved too far from goal
+            terminate = (progress >= max_episode_length - 1) or (goal_dist >= fall_dist)
+
+            terminations.append(terminate)
+
+        # Return concatenated terminations
+        return torch.tensor(terminations) if terminations else torch.tensor([False])

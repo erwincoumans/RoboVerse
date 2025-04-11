@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-from isaacgym import gymtorch
-
-ISAACGYM_AVAILABLE = True
-
 import random
 import time
 from contextlib import contextmanager
@@ -27,21 +23,18 @@ def timing_context(name: str, verbose: bool = False, timing_dict: dict | None = 
         timing_dict[name] = timing_dict.get(name, 0.0) + elapsed_time
 
 
-class IsaacGymWrapper:
-    """Wrapper around IsaacgymHandler for RL algorithms."""
+class IsaacLabWrapper:
+    """Wrapper around IsaaclabHandler for RL algorithms."""
 
     def __init__(self, scenario: ScenarioCfg, num_envs: int = 1, headless: bool = False, seed: int | None = None):
-        """Initialize the wrapper with an IsaacgymHandler."""
-        if not ISAACGYM_AVAILABLE:
-            raise ImportError("IsaacGym is not installed. Please install it to use IsaacGymWrapper.")
-
+        """Initialize the wrapper with an IsaaclabHandler."""
         # Set seed if provided
         if seed is not None:
             self.set_seed(seed)
 
         scenario.num_envs = num_envs
         scenario.headless = headless
-        env_class = get_sim_env_class(SimType("isaacgym"))
+        env_class = get_sim_env_class(SimType(scenario.sim))
         env = env_class(scenario)
         self.handler = env.handler
 
@@ -67,7 +60,6 @@ class IsaacGymWrapper:
         self.total_time = 0.0
 
         self.rgb_buffers = [[] for _ in range(self.num_envs)]
-        self.max_rgb_buffer_size = self.handler.task.episode_length
         self.writer = None
         self.global_step = 0
 
@@ -93,41 +85,65 @@ class IsaacGymWrapper:
         # Get observations from the handler
         handler_obs = self.handler.get_observation()
 
-        # Extract joint positions from DOF states
-        dof_state = self.handler._dof_states.clone()
-        joint_positions = dof_state[:, 0]
+        # Get all states for extracting joint positions
+        states = self.handler.get_states()
 
-        dofs_per_env = joint_positions.shape[0] // self.num_envs
-        joint_positions = joint_positions.reshape(self.num_envs, dofs_per_env)
+        # Extract joint positions from the states for each environment
+        joint_positions = []
+        for env_id in range(self.num_envs):
+            robot_name = self._robot.name
+            robot_state = states[env_id][robot_name]
 
-        # Create observation dictionary with joint positions
-        observation = {
-            "obs": joint_positions.clone(),
-        }
+            # Get robot joint positions
+            robot_joint_pos = [pos for pos in robot_state["dof_pos"].values()]
 
-        # Check if RGB images are available in the handler's observation
+            # Also get articulated object joint positions if available
+            for obj_name, obj_state in states[env_id].items():
+                if obj_name != robot_name and isinstance(obj_state, dict) and "dof_pos" in obj_state:
+                    for joint_pos in obj_state["dof_pos"].values():
+                        robot_joint_pos.append(joint_pos)
+
+            joint_positions.append(robot_joint_pos)
+
+        # Convert to torch tensor
+        obs_tensor = torch.tensor(joint_positions, device=self.device, dtype=torch.float32)
+
+        # Create observation dictionary
+        observation = {"obs": obs_tensor}
+
+        # Add RGB images if available
         if "rgb" in handler_obs and handler_obs["rgb"] is not None:
             try:
-                # Get RGB tensors for all environments
                 rgb_tensors = []
-
-                # If handler_obs["rgb"] is already a list/tensor with multiple environments
-                if isinstance(handler_obs["rgb"], (list, torch.Tensor)) and len(handler_obs["rgb"]) == self.num_envs:
-                    # Use the existing RGB tensors directly
+                if isinstance(handler_obs["rgb"], list) and len(handler_obs["rgb"]) == self.num_envs:
                     rgb_tensors = [tensor.to(self.device) for tensor in handler_obs["rgb"]]
                 else:
-                    # For each environment, try to get its RGB image
                     for env_id in range(self.num_envs):
                         if env_id < len(handler_obs["rgb"]):
                             rgb_tensors.append(handler_obs["rgb"][env_id].to(self.device))
                         else:
-                            # If no image for this env, use the first environment's image
                             rgb_tensors.append(handler_obs["rgb"][0].to(self.device))
 
-                # Stack all RGB tensors into a single tensor for better efficiency
                 observation["rgb"] = torch.stack(rgb_tensors, dim=0).float()
             except Exception as e:
                 print(f"Warning: Could not process RGB images from handler: {e}")
+
+        # Add depth images if available
+        if "depth" in handler_obs and handler_obs["depth"] is not None:
+            try:
+                depth_tensors = []
+                if isinstance(handler_obs["depth"], list) and len(handler_obs["depth"]) == self.num_envs:
+                    depth_tensors = [tensor.to(self.device) for tensor in handler_obs["depth"]]
+                else:
+                    for env_id in range(self.num_envs):
+                        if env_id < len(handler_obs["depth"]):
+                            depth_tensors.append(handler_obs["depth"][env_id].to(self.device))
+                        else:
+                            depth_tensors.append(handler_obs["depth"][0].to(self.device))
+
+                observation["depth"] = torch.stack(depth_tensors, dim=0).float()
+            except Exception as e:
+                print(f"Warning: Could not process depth images from handler: {e}")
 
         return observation
 
@@ -140,7 +156,7 @@ class IsaacGymWrapper:
         if hasattr(self.handler.task, "reward_fn"):
             return self.handler.task.reward_fn(states).to(self.device)
 
-        # Case 2: Task is a BaseRLTaskCfg with reward functions and weights
+        # Case 2: Task has reward_functions and reward_weights
         from metasim.cfg.tasks.base_task_cfg import BaseRLTaskCfg
 
         if isinstance(self.handler.task, BaseRLTaskCfg):
@@ -161,6 +177,8 @@ class IsaacGymWrapper:
 
     def get_success(self) -> torch.Tensor:
         """Get success states of all environments."""
+        success = self.handler.checker.check(self.handler)
+        self.success_buffer = success.to(self.device)
         return self.success_buffer.clone()
 
     def get_timeout(self) -> torch.Tensor:
@@ -169,8 +187,8 @@ class IsaacGymWrapper:
         return timeout
 
     def step(
-        self, action: torch.Tensor
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, None]:
+        self, action: list[dict]
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Step the environment forward."""
         step_start = time.time()
         self.total_steps += 1
@@ -180,58 +198,9 @@ class IsaacGymWrapper:
 
         self.timestep_buffer += 1
 
-        TIME_STEPS_TO_RUN = 3
-        for substep in range(TIME_STEPS_TO_RUN):
-            if self.verbose:
-                print(f"  Substep {substep + 1}/{TIME_STEPS_TO_RUN}")
-
-            # Step the physics
-            with timing_context("physics_simulation", self.verbose, self.step_timings):
-                self.handler.gym.simulate(self.handler.sim)
-                self.handler.gym.fetch_results(self.handler.sim, True)
-
-            # Refresh tensors
-            with timing_context("tensor_refresh", self.verbose, self.step_timings):
-                self.handler.gym.refresh_rigid_body_state_tensor(self.handler.sim)
-                self.handler.gym.refresh_actor_root_state_tensor(self.handler.sim)
-                self.handler.gym.refresh_dof_state_tensor(self.handler.sim)
-                self.handler.gym.refresh_jacobian_tensors(self.handler.sim)
-                self.handler.gym.refresh_mass_matrix_tensors(self.handler.sim)
-
-            # Deploy actions
-            with timing_context("action_deployment", self.verbose, self.step_timings):
-                action_input = torch.zeros_like(self.handler._dof_states[:, 0].clone())
-                action_array_all = action.cpu().numpy()
-                robot_dim = action_array_all.shape[1] if len(action_array_all.shape) > 1 else action_array_all.shape[0]
-
-                # Validate shape assumptions and compute chunk_size per environment
-                assert action_input.shape[0] % self.num_envs == 0, (
-                    "Mismatch between action input shape and number of environments"
-                )
-                chunk_size = action_input.shape[0] // self.num_envs
-
-                # Reshape action_input and deploy
-                action_input_2d = action_input.view(self.num_envs, chunk_size)
-                env_actions_tensor = torch.as_tensor(action_array_all, dtype=torch.float32, device=self.device)
-
-                # Handle both batched and single actions
-                if len(env_actions_tensor.shape) > 1:
-                    action_input_2d[:, chunk_size - robot_dim :] = env_actions_tensor
-                else:
-                    for i in range(self.num_envs):
-                        action_input_2d[i, chunk_size - robot_dim :] = env_actions_tensor
-
-                if substep == 0:
-                    self.handler.gym.set_dof_position_target_tensor(
-                        self.handler.sim, gymtorch.unwrap_tensor(action_input_2d)
-                    )
-
-            # Update viewer
-            with timing_context("graphics_update", self.verbose, self.step_timings):
-                if not self.headless and self.handler.viewer is not None:
-                    self.handler.gym.step_graphics(self.handler.sim)
-                    self.handler.gym.draw_viewer(self.handler.viewer, self.handler.sim, False)
-                    self.handler.gym.sync_frame_time(self.handler.sim)
+        # Step the environment using the handler
+        with timing_context("step_simulation", self.verbose, self.step_timings):
+            _, _, success, time_out, extras = self.handler.step(action)
 
         # Get observation and compute rewards
         with timing_context("get_observation", self.verbose, self.step_timings):
@@ -239,7 +208,6 @@ class IsaacGymWrapper:
 
         with timing_context("compute_rewards", self.verbose, self.step_timings):
             reward = self.get_reward().to(self.device)
-            success = self.get_success().to(self.device)
             timeout = self.get_timeout().to(self.device)
             termination = self.get_termination().to(self.device)
 
@@ -252,6 +220,12 @@ class IsaacGymWrapper:
                 obs_tensor = observation["obs"]
                 obs_tensor[timeout_indices] = updated_obs["obs"][timeout_indices]
                 observation["obs"] = obs_tensor
+                # Also update image observations if available
+                for key in ["rgb", "depth"]:
+                    if key in observation and key in updated_obs:
+                        img_tensor = observation[key]
+                        img_tensor[timeout_indices] = updated_obs[key][timeout_indices]
+                        observation[key] = img_tensor
 
         # Handle resets for environments that are done (success or termination)
         with timing_context("handle_dones", self.verbose, self.step_timings):
@@ -262,11 +236,12 @@ class IsaacGymWrapper:
                 obs_tensor = observation["obs"]
                 obs_tensor[done_indices] = updated_obs["obs"][done_indices]
                 observation["obs"] = obs_tensor
-                # Also update RGB observations if available
-                if "rgb" in observation and "rgb" in updated_obs:
-                    rgb_tensor = observation["rgb"]
-                    rgb_tensor[done_indices] = updated_obs["rgb"][done_indices]
-                    observation["rgb"] = rgb_tensor
+                # Also update image observations if available
+                for key in ["rgb", "depth"]:
+                    if key in observation and key in updated_obs:
+                        img_tensor = observation[key]
+                        img_tensor[done_indices] = updated_obs[key][done_indices]
+                        observation[key] = img_tensor
 
         dones = timeout.squeeze(1) | success | termination
 
@@ -288,63 +263,26 @@ class IsaacGymWrapper:
             print("=" * 30 + "\n")
 
         reward = reward.unsqueeze(1)
+        info = {"success": success}
         return (
             observation,
             reward,
             dones,
             timeout,
-            None,
+            info,
         )
 
     def reset_handler(self, env_ids: list[int] | None = None):
+        """Reset the handler and checker for the specified environments."""
         if env_ids is None:
             env_ids = list(range(self.handler.num_envs))
 
-        # Reset episode length buffer
-        self.handler._episode_length_buf = [0 for _ in range(self.handler.num_envs)]
-
-        # Create default states for resetting robot and objects to their initial positions
-        default_states = []
-        for _ in range(self.handler.num_envs):
-            env_state = {"objects": {}, "robots": {}}
-
-            # Set default positions/rotations for objects
-            for obj in self.handler.objects:
-                obj_state = {"pos": obj.default_position, "rot": obj.default_orientation}
-
-                # Add joint positions for articulated objects
-                if hasattr(obj, "default_joint_positions") and obj.default_joint_positions:
-                    obj_state["dof_pos"] = obj.default_joint_positions
-
-                env_state["objects"][obj.name] = obj_state
-
-            # Set default position/rotation for robot
-            robot_state = {"pos": self.handler.robot.default_position, "rot": self.handler.robot.default_orientation}
-
-            # Add default joint positions for the robot
-            if hasattr(self.handler.robot, "default_joint_positions") and self.handler.robot.default_joint_positions:
-                robot_state["dof_pos"] = self.handler.robot.default_joint_positions
-
-            env_state["robots"][self.handler.robot.name] = robot_state
-            default_states.append(env_state)
-
-        # Reset states using the handler's set_states method
-        self.handler.set_states(default_states, env_ids=env_ids)
-
-        # Then call the original checker reset
-        self.handler.checker.reset(self.handler, env_ids=env_ids)
-
-        # Simulate to apply the changes
-        self.handler.simulate()
-
-        # Get observation after reset
-        obs = self.handler.get_observation()
-
-        return obs, None
+        # Reset the handler using the existing handler.reset method
+        self.handler.reset(env_ids=env_ids)
 
     def reset(self) -> dict[str, torch.Tensor]:
         """Reset all environments."""
-        # Call the handler's reset method which uses configurations
+        # Call the handler's reset method
         self.reset_handler()
 
         # Reset internal state tracking buffers
@@ -367,7 +305,7 @@ class IsaacGymWrapper:
 
     def render(self) -> None:
         """Render the environment."""
-        self.handler.render()
+        self.handler.refresh_render()
 
     def close(self) -> None:
         """Close the environment."""

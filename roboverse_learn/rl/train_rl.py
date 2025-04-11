@@ -16,6 +16,8 @@ import wandb
 from omegaconf import DictConfig, OmegaConf
 from termcolor import cprint
 
+from roboverse_learn.rl.envs.env_wrapper import RLEnv
+
 
 def set_np_formatting():
     """Formats numpy print"""
@@ -33,14 +35,12 @@ def set_np_formatting():
 
 @hydra.main(config_path="configs", config_name="default")
 def main(cfg: DictConfig):
-    if cfg.environment.sim_name == "isaacgym":
-        from isaacgym import gymapi, gymtorch, gymutil  # noqa: F401
-
+    # Do simulator-specific imports first
+    sim_name = cfg.environment.sim_name.lower()
     set_np_formatting()
 
     from metasim.cfg.scenario import ScenarioCfg
-    from metasim.cfg.sensors import PinholeCameraCfg
-    from metasim.utils.setup_util import SimType, get_robot, get_sim_env_class, get_task
+    from metasim.utils.setup_util import get_robot, get_task
     from roboverse_learn.rl.algos import get_algorithm
 
     if cfg.experiment.multi_gpu:
@@ -55,54 +55,45 @@ def main(cfg: DictConfig):
     task = get_task(cfg.train.task_name)
     robot = get_robot(cfg.train.robot_name)
     scenario = ScenarioCfg(task=task, robot=robot)
-    scenario.cameras = [
-        PinholeCameraCfg(
-            name="camera",
-            data_types=["rgb", "depth"],
-            width=64,
-            height=64,
-            pos=(1.5, 0.0, 1.5),
-            look_at=(0.0, 0.0, 0.0),
-        )
-    ]
+    scenario.cameras = []
 
     tic = time.time()
-    # Use our wrappers based on the simulator type
-    sim_name = cfg.environment.sim_name.lower()
-    if sim_name == "isaacgym":
-        # Import IsaacGymWrapper only when needed
-        from roboverse_learn.rl.envs.isaacgym_wrapper import IsaacGymWrapper
+    # # Use our wrappers based on the simulator type
+    # if sim_name == "isaacgym":
+    #     # Import IsaacGymWrapper only when needed
+    #     from roboverse_learn.rl.envs.isaacgym_wrapper import IsaacGymWrapper
 
-        env = IsaacGymWrapper(
-            scenario, cfg.environment.num_envs, headless=cfg.environment.headless, seed=cfg.experiment.seed
-        )
-        env.launch()  # Initialize the environment
-    elif sim_name == "mujoco":
-        # Import MujocoWrapper only when needed
-        from roboverse_learn.rl.envs.mujoco_wrapper import MujocoWrapper
+    #     env = IsaacGymWrapper(
+    #         scenario, cfg.environment.num_envs, headless=cfg.environment.headless, seed=cfg.experiment.seed
+    #     )    scenario.sim_name = sim_name
+    #     # Import MujocoWrapper only when needed
+    #     from roboverse_learn.rl.envs.mujoco_wrapper import MujocoWrapper
 
-        env = MujocoWrapper(
-            scenario,
-            cfg.environment.num_envs,
-            headless=cfg.environment.headless,
-            seed=cfg.experiment.seed,
-            rgb_observation=cfg.environment.rgb_observation,
-        )
-        env.launch()  # Initialize the environment
-    elif sim_name == "isaaclab":
-        # Import IsaacLabWrapper only when needed
-        from roboverse_learn.rl.envs.isaaclab_wrapper import IsaacLabWrapper
+    #     env = MujocoWrapper(
+    #         scenario,sim_name
+    #         seed=cfg.experiment.seed,
+    #         rgb_observation=cfg.environment.rgb_observation,
+    #     )
+    #     env.launch()  # Initialize the environment
+    # elif sim_name == "isaaclab":
+    #     # For IsaacLab, we need a special import order as in replay_demo.py
+    #     # The import must happen only after isaacgym is imported
+    #     from roboverse_learn.rl.envs.isaaclab_wrapper import IsaacLabWrapper
 
-        env = IsaacLabWrapper(
-            scenario, cfg.environment.num_envs, headless=cfg.environment.headless, seed=cfg.experiment.seed
-        )
-        env.launch()  # Initialize the environment
-    else:
-        env_class = get_sim_env_class(SimType(cfg.environment.sim_name))
-        env = env_class(scenario, cfg.environment.num_envs, headless=cfg.environment.headless)
-        # Set seed if the environment has a set_seed method
-        if hasattr(env, "set_seed"):
-            env.set_seed(cfg.experiment.seed)
+    #     env = IsaacLabWrapper(
+    #         scenario, cfg.environment.num_envs, headless=cfg.environment.headless, seed=cfg.experiment.seed
+    #     )
+    #     # IsaacLab must launch right after importing
+    #     env.launch()  # Initialize the environment
+    # else:
+    # env_class = get_sim_env_class(SimType(sim_name))
+    # env = env_class(scenario, cfg.environment.num_envs, headless=cfg.environment.headless)
+    scenario.num_envs = cfg.environment.num_envs
+    scenario.headless = cfg.environment.headless
+    env = RLEnv(sim_name, scenario)
+    # Set seed if the environment has a set_seed method
+    if hasattr(env, "set_seed"):
+        env.set_seed(cfg.experiment.seed)
 
     # Enable verbose mode if needed
     if hasattr(env, "set_verbose"):
